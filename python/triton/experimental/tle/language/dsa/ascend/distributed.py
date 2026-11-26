@@ -32,6 +32,45 @@ def _scalar_dtype(t):
     return d.element_ty if hasattr(d, 'element_ty') else d
 
 
+# ``convert-triton-distributed-to-hivm`` rejects any distributed op that does
+# not carry a ``distributed.core_type`` attribute; the value decides whether the
+# resulting ``hivm.hir.custom`` lands in the CUBE function, the VECTOR function,
+# or both.
+#
+# Everything TLE emits here is VECTOR. Marking the collective barrier as
+# ``cube_and_vector`` (what TDA's ``libaclshmem_device.barrier_all`` does) makes
+# BiShengIR compile the whole kernel in "mix" mode, and in mix mode the body is
+# cloned into both the AIC and the AIV function. Every distributed op then runs
+# twice per PE: measured on Ascend950DT, one ``signal`` delivered two increments
+# and ``signal_wait`` (wait-until-equal) hung. TDA tolerates that because its
+# kernels program core roles explicitly; TLE's distributed subset does not, so a
+# vector-only barrier is required for single issuance.
+#
+# Consequence: on Ascend the barrier synchronises the AIV side of every PE. A
+# kernel that also has cube work must synchronise its AIC part separately
+# (``tle.dsa`` cube sync); mixing cube compute with TLE distributed ops is not
+# supported yet.
+_CORE_TYPE_BY_SYMBOL = {
+    "aclshmem_barrier": "vector",
+    "aclshmem_barrier_all": "vector",
+    "aclshmem_sync": "vector",
+    "aclshmem_sync_all": "vector",
+    "aclshmemx_barrier_vec": "vector",
+    "aclshmemx_barrier_all_vec": "vector",
+    "aclshmemx_sync_vec": "vector",
+    "aclshmemx_sync_vec_all": "vector",
+}
+# Default to VECTOR for the same reason: a ``cube_or_vector`` fallback also
+# pushes the kernel into mix mode and duplicates the op.
+_DEFAULT_EXTERN_CORE_TYPE = "vector"
+
+
+def _mark_core_type(call, symbol: str, _semantic):
+    core_type = _CORE_TYPE_BY_SYMBOL.get(symbol, _DEFAULT_EXTERN_CORE_TYPE)
+    call.set_attr("distributed.core_type", _semantic.builder.get_string_attr(core_type))
+    return call
+
+
 def _dispatch(
     func,
     lib_name: str,
@@ -82,6 +121,7 @@ def _dispatch(
             [ret_type.to_ir(_semantic.builder) for ret_type in ret_types],
             is_pure,
         )
+        _mark_core_type(call, symbol, _semantic)
 
         if len(ret_types) == 0:
             return tensor(call, tl.void)
@@ -246,6 +286,243 @@ def shard_id(
 
 
 @builtin
+def n_pes(
+    dev_mem_ptr=None,
+    _semantic=None,
+    ret_dtype=tl.int32,
+):
+    """Return the number of participants (PEs) in the current communicator.
+
+    Ascend reads the PE count from the ACLSHMEM runtime, so ``dev_mem_ptr`` is
+    accepted for signature compatibility with the portable implementation but
+    is not dereferenced.
+    """
+    dev_mem_ptr = tl._unwrap_if_constexpr(dev_mem_ptr)
+    if dev_mem_ptr is not None and not isinstance(dev_mem_ptr, tl.tensor):
+        raise TypeError(f"dev_mem_ptr must be a tl.tensor or None, got {type(dev_mem_ptr).__name__}")
+
+    axis = _semantic._convert_elem_to_ir_value(-1, require_i64=False)
+    value = tl.tensor(_semantic.builder.create_get_num_ranks(axis), tl.int32)
+    if ret_dtype == tl.int32:
+        return value
+    return tl.cast(value, ret_dtype, _semantic=_semantic)
+
+
+# Ascend signal slots live in the symmetric-heap buffer that the kernel receives
+# as its distributed context. Every slot owns a full 64B line so that adjacent
+# slots are not fetched together with the signal they synchronise.
+_SIGNAL_SLOT_STRIDE_BYTES = 64
+
+# ``aclshmem_<type>_wait_until`` device wrappers that accept a local signal
+# address plus the value to wait for.
+_ACLSHMEM_WAIT_SYMBOL = {
+    tl.int32: "aclshmem_wait_int32",
+    tl.int64: "aclshmem_wait_int64",
+}
+
+
+def _dist_ir():
+    try:
+        from triton._C.libtriton.distributed import ir as dist_ir
+    except ImportError as exc:
+        raise NotImplementedError("Ascend TLE signal primitives require a FlagTree build with "
+                                  "TRITON_BUILD_TD=ON") from exc
+    return dist_ir
+
+
+def _signal_slot_ptr(device_dptr, slot_id, _semantic):
+    if not isinstance(device_dptr, tensor) or device_dptr.type.is_block() or not device_dptr.dtype.is_ptr():
+        raise TypeError("device_dptr must be a scalar pointer into the ACLSHMEM signal buffer")
+    elem_ty = device_dptr.dtype.element_ty
+    if elem_ty not in (tl.int32, tl.int64, tl.uint64):
+        raise TypeError(f"signal slots must be int32/int64/uint64, got {elem_ty}")
+    elem_bits = 32 if elem_ty == tl.int32 else 64
+
+    slot = slot_id if isinstance(slot_id, tl.tensor) else _semantic.to_tensor(slot_id)
+    if not slot.dtype.is_int():
+        raise TypeError(f"slot_id must be an integer, got {slot.dtype}")
+    stride_elems = _SIGNAL_SLOT_STRIDE_BYTES * 8 // elem_bits
+    slot_offset = _semantic.mul(_semantic.to_tensor(stride_elems), slot, sanitize_overflow=False)
+    return _semantic.add(device_dptr, slot_offset, sanitize_overflow=False)
+
+
+@builtin
+def signal(
+    device_dptr,
+    peer,
+    slot_id,
+    value=None,
+    op="inc",
+    space="intra_node",
+    group_kind="block",
+    context_id=0,
+    scope="system",
+    _semantic=None,
+):
+    """Atomically update the sync slot of a remote peer.
+
+    Ascend lowers this to ``distributed.notify`` -> ``aclshmemx_signal_op`` /
+    ``aclshmem_atomic_add_*``. ``slot_id`` indexes the symmetric-heap signal
+    buffer passed as ``device_dptr``; slots are 64B apart.
+
+    ``space`` / ``group_kind`` / ``scope`` are accepted for API compatibility
+    with the portable implementation. The ACLSHMEM data plane owns transport
+    selection, so they do not change the emitted IR; ``context_id`` selects a
+    pre-allocated network context and therefore only ``0`` is supported.
+    """
+    op_name = str(tl._unwrap_if_constexpr(op)).lower()
+    if op_name not in ("inc", "add"):
+        raise ValueError(f"op must be 'inc' or 'add', got {op_name!r}")
+
+    value = tl._unwrap_if_constexpr(value)
+    if op_name == "inc":
+        if value is not None:
+            raise ValueError("value must be omitted when op='inc'")
+        signal_value = 1
+    else:
+        if value is None:
+            raise ValueError("value is required when op='add'")
+        signal_value = value
+
+    space = tl._unwrap_if_constexpr(space)
+    space = "intra_node" if space is None else str(space).lower()
+    comm_scope = {
+        "intra": "INTRA_NODE",
+        "intra_node": "INTRA_NODE",
+        "inter": "INTER_NODE",
+        "inter_node": "INTER_NODE",
+        "world": "INTER_NODE",
+    }.get(space)
+    if comm_scope is None:
+        raise ValueError(f"space must be intra_node, inter_node, or world, got {space!r}")
+
+    context_id = tl._unwrap_if_constexpr(context_id)
+    if context_id is None:
+        context_id = 0
+    if not isinstance(context_id, int) or context_id != 0:
+        raise NotImplementedError("Ascend TLE signal has no pre-allocated network contexts; "
+                                  f"context_id must be 0, got {context_id!r}")
+
+    group_kind = tl._unwrap_if_constexpr(group_kind)
+    if group_kind is not None and str(group_kind).lower() not in ("thread", "warp", "block"):
+        raise ValueError(f"group_kind must be thread, warp, or block, got {group_kind!r}")
+    scope = tl._unwrap_if_constexpr(scope)
+    if scope is not None and str(scope).lower() not in ("system", "device"):
+        raise ValueError(f"scope must be 'system' or 'device', got {scope!r}")
+
+    if not hasattr(_semantic.builder, "create_notify"):
+        raise NotImplementedError("Ascend TLE signal requires a FlagTree build with TRITON_BUILD_TD=ON")
+
+    dist_ir = _dist_ir()
+    slot_ptr = _signal_slot_ptr(device_dptr, slot_id, _semantic)
+    peer_t = peer if isinstance(peer, tl.tensor) else _semantic.to_tensor(peer)
+    if not peer_t.dtype.is_int():
+        raise TypeError(f"peer must be an integer rank, got {peer_t.dtype}")
+    signal_t = signal_value if isinstance(signal_value, tl.tensor) else _semantic.to_tensor(signal_value)
+    signal_t = tl.cast(signal_t, tl.int64, _semantic=_semantic)
+
+    _semantic.builder.create_notify(slot_ptr.handle, signal_t.handle, peer_t.handle,
+                                    dist_ir.SIGNAL_OP.ADD, getattr(dist_ir.COMM_SCOPE, comm_scope))
+    return None
+
+
+@builtin
+def signal_wait(
+    device_dptr,
+    slot_id,
+    wait_kind,
+    target=None,
+    group_kind="block",
+    context_id=0,
+    order="acquire",
+    _semantic=None,
+):
+    """Block until the local sync slot reaches ``target``.
+
+    Ascend lowers this to a side-effecting ``aclshmem_wait_<dtype>`` extern call,
+    which spins until the slot equals ``target``. Only ``wait_kind="signal"`` is
+    supported: ACLSHMEM has no runtime shadow buffer, so ``"shadow"`` and the
+    counter form ``"counter"`` are rejected instead of being approximated.
+    """
+    wait_kind = str(tl._unwrap_if_constexpr(wait_kind)).lower()
+    if wait_kind != "signal":
+        raise NotImplementedError(f"Ascend TLE signal_wait only supports wait_kind='signal', got {wait_kind!r}")
+    if target is None:
+        raise ValueError("target is required when wait_kind='signal'")
+
+    context_id = tl._unwrap_if_constexpr(context_id)
+    if context_id is None:
+        context_id = 0
+    if not isinstance(context_id, int) or context_id != 0:
+        raise NotImplementedError("Ascend TLE signal_wait has no pre-allocated network contexts; "
+                                  f"context_id must be 0, got {context_id!r}")
+    group_kind = tl._unwrap_if_constexpr(group_kind)
+    if group_kind is not None and str(group_kind).lower() not in ("thread", "warp", "block"):
+        raise ValueError(f"group_kind must be thread, warp, or block, got {group_kind!r}")
+    order = tl._unwrap_if_constexpr(order)
+    order = "acquire" if order is None else str(order).lower()
+    if order != "acquire":
+        raise NotImplementedError(f"Ascend TLE signal_wait only provides the acquire form, got order={order!r}")
+
+    slot_ptr = _signal_slot_ptr(device_dptr, slot_id, _semantic)
+    elem_ty = slot_ptr.dtype.element_ty
+    symbol = _ACLSHMEM_WAIT_SYMBOL.get(elem_ty)
+    if symbol is None:
+        raise TypeError(f"signal_wait slots must be int32 or int64, got {elem_ty}")
+
+    target_t = target if isinstance(target, tl.tensor) else _semantic.to_tensor(target)
+    target_t = tl.cast(target_t, elem_ty, _semantic=_semantic)
+    num_barriers = tl.cast(_semantic.to_tensor(1), tl.int64, _semantic=_semantic)
+
+    # ``distributed.wait`` is not used here on purpose: the op only exposes its
+    # ordering through the token it returns, and the greedy rewriter deletes a
+    # wait whose token is never consumed by a ``consume_token``. ``tle.signal_wait``
+    # returns ``None`` (same as the portable implementation), so the wait has to
+    # be a side-effecting extern call to survive DCE.
+    _extern_call(
+        "libshmem_device",
+        "",
+        [slot_ptr, num_barriers, target_t],
+        {
+            (elem_ty, tl.int64, elem_ty): (symbol, (tl.int32,)),
+        },
+        is_pure=False,
+        _semantic=_semantic,
+    )
+    return None
+
+
+# Barrier options the Ascend implementation can honour. ``aclshmem_barrier_all``
+# is a convergent, full-communicator barrier: it has no team scope, no
+# arrive/wait split and no per-call channel. Anything else has to be rejected
+# instead of silently degrading to a full barrier.
+_BARRIER_DEFAULT_OPTIONS = {
+    "group_kind": "block",
+    "barrier_kind": "sync",
+    "order": "acqrel",
+    "index": 0,
+    "context_id": 0,
+    "memory_scope": "system",
+}
+
+
+def _check_barrier_option(name: str, value) -> None:
+    value = tl._unwrap_if_constexpr(value)
+    if value is None:
+        return
+    if isinstance(value, tl.tensor):
+        raise TypeError(f"tle.distributed_barrier: {name} must be a compile-time constant")
+    expected = _BARRIER_DEFAULT_OPTIONS[name]
+    if isinstance(value, str):
+        value = value.lower()
+    if value != expected:
+        raise NotImplementedError(
+            f"tle.distributed_barrier: {name}={value!r} is not supported on Ascend; "
+            f"aclshmem_barrier_all only implements the convergent full-communicator "
+            f"barrier, so only {name}={expected!r} (or None) is accepted")
+
+
+@builtin
 def distributed_barrier(
     mesh=None,
     device_dptr=None,
@@ -254,11 +531,17 @@ def distributed_barrier(
     barrier_kind=None,
     order=None,
     index: int = None,
+    context_id: int = None,
+    memory_scope: str = None,
     _semantic=None,
 ):
     """
     Distributed barrier across all ranks.
-    Currently only ``device`` level is supported.
+
+    Ascend lowers this to ``aclshmem_barrier_all``, which synchronises the whole
+    communicator. Team-scoped barriers (sub-meshes, ``space="inter_node"``) and
+    the non-default ``group_kind`` / ``barrier_kind`` / ``order`` / ``index`` /
+    ``context_id`` / ``memory_scope`` options are rejected rather than ignored.
     """
     mesh = tl._unwrap_if_constexpr(mesh)
     if mesh is not None:
@@ -267,12 +550,19 @@ def distributed_barrier(
     space = tl._unwrap_if_constexpr(space)
     if space is not None and not isinstance(space, str):
         raise TypeError(f"space must be str or None, got {type(space).__name__}")
-    assert space is None or space == "device", \
-        f"TODO: space='{space}' not yet implemented (only 'device' is supported)"
+    if space is not None:
+        space = space.lower()
+        aliases = {"device": "device", "intra": "device", "intra_node": "device", "world": "world"}
+        if space not in aliases:
+            raise NotImplementedError(
+                f"tle.distributed_barrier: space={space!r} is not supported on Ascend; "
+                f"only None, 'device' (aliases 'intra'/'intra_node') and 'world' map to "
+                f"aclshmem_barrier_all")
+        space = aliases[space]
 
-    index = tl._unwrap_if_constexpr(index)
-    if index is not None and not isinstance(index, int):
-        raise TypeError(f"index must be int or None, got {type(index).__name__}")
+    for name, value in (("group_kind", group_kind), ("barrier_kind", barrier_kind), ("order", order),
+                        ("index", index), ("context_id", context_id), ("memory_scope", memory_scope)):
+        _check_barrier_option(name, value)
 
     if device_dptr is not None:
         assert isinstance(device_dptr, tl.tensor) and device_dptr.dtype.is_ptr(), \

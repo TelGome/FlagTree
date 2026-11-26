@@ -71,8 +71,8 @@ from triton._flagtree_backend import FLAGTREE_BACKEND
 if FLAGTREE_BACKEND == "ascend":
     # The 3.5 Ascend tutorials use the SHMEM/HCCL communicator and the
     # symm_at/get_rank distributed primitives, not the FlagCX path above.
-    from .dsa.ascend.distributed import (MeshConfig, device_mesh, remote, shard_id, distributed_barrier,
-                                         swizzle2d_Nz, gemm_swizzle2d_Nz)
+    from .dsa.ascend.distributed import (MeshConfig, device_mesh, remote, shard_id, n_pes, signal, signal_wait,
+                                         distributed_barrier, swizzle2d_Nz, gemm_swizzle2d_Nz)
 
     def _ascend_communication():
         from .dsa.ascend import communication
